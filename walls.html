@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Crying Walls</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#0b0a0c;color:#f4efe9;font-family:'Courier Prime',ui-monospace,monospace;overflow:hidden}
+  *{box-sizing:border-box}
+  #v,#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #v{object-fit:cover}
+  #c{object-fit:contain;display:none;background:#0b0a0c}
+  .top{position:fixed;top:calc(16px + env(safe-area-inset-top));left:0;right:0;text-align:center;font-size:14px;z-index:5;text-shadow:0 1px 8px #000;padding:0 16px;pointer-events:none}
+  .top b{display:block;font-weight:400;font-size:22px;margin-bottom:4px}
+  .bar{position:fixed;left:0;right:0;bottom:calc(18px + env(safe-area-inset-bottom));display:flex;justify-content:center;align-items:center;gap:10px;z-index:5;flex-wrap:wrap;padding:0 12px}
+  button,label.btn{font:inherit;font-size:15px;border-radius:999px;padding:11px 18px;min-height:44px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:rgba(18,16,20,.55);color:#f4efe9;border:1px solid rgba(255,255,255,.3);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+  button:focus-visible,label.btn:focus-within{outline:2px solid #f4efe9;outline-offset:3px}
+  #shoot{width:76px;height:76px;padding:0;border-radius:50%;background:rgba(255,255,255,.18);border:4px solid #f4efe9;justify-content:center}
+  #shoot::after{content:"";width:56px;height:56px;border-radius:50%;background:#f4efe9}
+  #shoot:active::after{transform:scale(.9)}
+  input[type=file]{position:absolute;opacity:0;width:1px;height:1px}
+  #rec.on{background:#e5484d;border-color:#e5484d;color:#fff}
+  .seg button.sel{background:#f4efe9;color:#0b0a0c}
+  #play{display:none}
+  #busy{position:fixed;inset:0;display:none;place-items:center;z-index:6;background:rgba(11,10,12,.55);text-align:center;padding:24px}
+  #busy .t{font-size:16px}
+  #busy .p{height:2px;width:200px;background:rgba(255,255,255,.2);margin:14px auto 0;overflow:hidden;border-radius:2px}
+  #busy .p i{display:block;height:100%;width:0;background:#f4efe9;transition:width .2s}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted autoplay></video>
+<canvas id="c"></canvas>
+
+<div class="top" id="msg"><b>Crying Walls</b>point at a poster with words, then tap</div>
+
+<div class="bar" id="live">
+  <label class="btn">Photo<input id="file" type="file" accept="image/*"></label>
+  <button id="shoot" aria-label="Capture"></button>
+  <button id="flip" aria-label="Switch camera">Flip</button>
+</div>
+
+<div class="bar" id="play">
+  <button id="again">↺ Again</button>
+  <span class="seg" role="group" aria-label="Speed"><button data-s="1.8">Slow</button> <button data-s="1" class="sel">Normal</button> <button data-s="0.5">Fast</button></span>
+  <button id="rec">● Record</button>
+  <button id="new">New</button>
+</div>
+
+<div id="busy"><div><div class="t" id="busyT">Reading the letters…</div><div class="p"><i id="busyP"></i></div></div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js"></script>
+<script>
+{
+const $ = id => document.getElementById(id);
+const video = $('v'), cv = $('c'), ctx = cv.getContext('2d');
+const MAXSIDE = 1440;
+const TESS_OPTS = window.TESS_OPTS || {};
+
+let facing = 'environment', stream = null, worker = null;
+let orig = null;              // canvas with the untouched photo
+let base = null, bctx = null; // canvas that gets holes as letters leave
+let letters = [], t0 = 0, playing = false, speed = 1, raf = 0;
+let rec = null, chunks = [], recStopAt = 0;
+
+/* ---------- camera ---------- */
+async function startCam() {
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    video.srcObject = stream; await video.play();
+  } catch (e) {
+    say('Camera unavailable', 'allow camera access, or use Photo to pick one');
+  }
+}
+function say(title, line) { $('msg').innerHTML = `<b>${title}</b>${line || ''}`; $('msg').style.display = 'block'; }
+
+function grabVisible() {
+  // capture exactly what the cover-fitted video shows
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const s = Math.max(innerWidth / vw, innerHeight / vh);
+  const cw = innerWidth / s, ch = innerHeight / s, sx = (vw - cw) / 2, sy = (vh - ch) / 2;
+  const k = Math.min(1, MAXSIDE / Math.max(cw, ch));
+  const c = document.createElement('canvas');
+  c.width = Math.round(cw * k); c.height = Math.round(ch * k);
+  c.getContext('2d').drawImage(video, sx, sy, cw, ch, 0, 0, c.width, c.height);
+  return c;
+}
+
+function fromFile(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file), im = new Image();
+    im.onload = () => {
+      const k = Math.min(1, MAXSIDE / Math.max(im.width, im.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(im.width * k); c.height = Math.round(im.height * k);
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url); res(c);
+    };
+    im.onerror = rej; im.src = url;
+  });
+}
+
+/* ---------- reading letters ---------- */
+async function getWorker() {
+  if (worker) return worker;
+  worker = await Tesseract.createWorker('eng+ita', 1, {
+    ...TESS_OPTS,
+    logger: m => { if (m.progress != null) $('busyP').style.width = Math.round(m.progress * 100) + '%'; if (m.status) $('busyT').textContent = m.status.startsWith('recogn') ? 'Reading the letters…' : 'Waking up the reader…'; }
+  });
+  await worker.setParameters({ tessedit_pageseg_mode: '11' }); // sparse text: posters, signs
+  return worker;
+}
+
+function collectBoxes(data, W, H) {
+  const out = [];
+  let lineNo = 0;
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) {
+    lineNo++;
+    for (const w of l.words || []) {
+      if (w.confidence < 25 || !/[\p{L}\p{N}]/u.test(w.text)) continue;
+      const syms = (w.symbols || []).filter(s => /[\p{L}\p{N}!?&.,'’-]/u.test(s.text));
+      const boxes = syms.length ? syms.map(s => s.bbox) : splitWord(w);
+      for (const bb of boxes) {
+        const bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0;
+        if (bw < 2 || bh < 5 || bw > W * 0.5 || bh > H * 0.6) continue;
+        out.push({ x0: bb.x0, y0: bb.y0, x1: bb.x1, y1: bb.y1, line: lineNo });
+      }
+    }
+  }
+  return out;
+}
+function overlap(a, b) {
+  const ix = Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)), iy = Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+  const i = ix * iy, u = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - i;
+  return u > 0 ? i / u : 0;
+}
+function splitWord(w) {
+  const n = Math.max(1, [...w.text].length), { x0, y0, x1, y1 } = w.bbox, step = (x1 - x0) / n;
+  return Array.from({ length: n }, (_, i) => ({ x0: Math.round(x0 + i * step), y0, x1: Math.round(x0 + (i + 1) * step), y1 }));
+}
+
+/* ---------- cutting letters out of the photo ---------- */
+function cutLetters(boxes) {
+  const W = orig.width, H = orig.height;
+  const src = orig.getContext('2d').getImageData(0, 0, W, H).data;
+  const px = (x, y) => { x = Math.max(0, Math.min(W - 1, x)); y = Math.max(0, Math.min(H - 1, y)); const i = (y * W + x) * 4; return [src[i], src[i + 1], src[i + 2]]; };
+  const res = [];
+  for (const b of boxes) {
+    const pad = Math.max(1, Math.round((b.y1 - b.y0) * 0.08));
+    const x0 = Math.max(0, b.x0 - 1), y0 = Math.max(0, b.y0 - pad);
+    const x1 = Math.min(W - 1, b.x1 + 1), y1 = Math.min(H - 1, b.y1 + pad);
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w < 3 || h < 3) continue;
+    // background = median of the ring just outside the box
+    const ring = [[], [], []];
+    for (let x = x0 - 2; x <= x1 + 2; x++) for (const y of [y0 - 2, y1 + 2]) { const c = px(x, y); ring[0].push(c[0]); ring[1].push(c[1]); ring[2].push(c[2]); }
+    for (let y = y0; y <= y1; y++) for (const x of [x0 - 2, x1 + 2]) { const c = px(x, y); ring[0].push(c[0]); ring[1].push(c[1]); ring[2].push(c[2]); }
+    const bg = ring.map(a => { a.sort((m, n) => m - n); return a[a.length >> 1]; });
+    // alpha from how far each pixel is from the background
+    const alpha = new Float32Array(w * h), soft = new Float32Array(w * h);
+    let ink = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const c = px(x0 + x, y0 + y);
+      const d = Math.hypot(c[0] - bg[0], c[1] - bg[1], c[2] - bg[2]);
+      const a = Math.max(0, Math.min(1, (d - 22) / 48));
+      alpha[y * w + x] = a; ink += a;
+      soft[y * w + x] = Math.max(0, Math.min(1, (d - 8) / 26));   // catches anti-aliased edges for the hole
+    }
+    if (ink < w * h * 0.04) continue; // nothing there
+    const glyph = document.createElement('canvas'); glyph.width = w; glyph.height = h;
+    const patch = document.createElement('canvas'); patch.width = w; patch.height = h;
+    const gd = glyph.getContext('2d').createImageData(w, h), pd = patch.getContext('2d').createImageData(w, h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, o = i * 4, c = px(x0 + x, y0 + y);
+      gd.data[o] = c[0]; gd.data[o + 1] = c[1]; gd.data[o + 2] = c[2]; gd.data[o + 3] = Math.round(alpha[i] * 255);
+      // hole fill: blend of horizontal and vertical interpolation from the edges
+      let am = 0;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const xx = x + dx, yy = y + dy;
+        if (xx >= 0 && yy >= 0 && xx < w && yy < h) am = Math.max(am, soft[yy * w + xx]);
+      }
+      if (am <= 0) continue;
+      const clean = c => Math.hypot(c[0] - bg[0], c[1] - bg[1], c[2] - bg[2]) > 30 ? bg : c;
+      const L = clean(px(x0 - 1, y0 + y)), R = clean(px(x1 + 1, y0 + y)), T = clean(px(x0 + x, y0 - 1)), B = clean(px(x0 + x, y1 + 1));
+      const fx = (x + 1) / (w + 1), fy = (y + 1) / (h + 1);
+      for (let k = 0; k < 3; k++) {
+        const hz = L[k] * (1 - fx) + R[k] * fx, vt = T[k] * (1 - fy) + B[k] * fy;
+        pd.data[o + k] = Math.round(0.5 * hz + 0.5 * vt);
+      }
+      pd.data[o + 3] = Math.round(Math.min(1, am * 2) * 255);
+    }
+    glyph.getContext('2d').putImageData(gd, 0, 0);
+    patch.getContext('2d').putImageData(pd, 0, 0);
+    res.push({ x: x0, y: y0, w, h, line: b.line, glyph, patch });
+  }
+  return res;
+}
+
+/* ---------- animation ---------- */
+function schedule() {
+  const n = letters.length;
+  const order = letters.map((l, i) => i).sort((a, b) => (Math.round(letters[a].y / 40) - Math.round(letters[b].y / 40)) || (letters[a].x - letters[b].x));
+  const gap = Math.max(0.03, Math.min(0.22, 7 / Math.max(1, n))) * speed;
+  order.forEach((li, rank) => {
+    const l = letters[li];
+    l.tStart = 1.0 * speed + rank * gap + Math.random() * 1.4 * speed;  // starts trembling
+    l.tFall = l.tStart + 0.35 + Math.random() * 0.5;                 // lets go
+    l.state = 0; l.vx = (Math.random() - 0.5) * 30; l.vy = 0; l.r = 0; l.vr = (Math.random() - 0.5) * 2.4; l.dx = 0; l.dy = 0;
+  });
+}
+
+function reset() {
+  base = document.createElement('canvas'); base.width = orig.width; base.height = orig.height;
+  bctx = base.getContext('2d'); bctx.drawImage(orig, 0, 0);
+  schedule();
+  t0 = performance.now(); playing = true;
+}
+
+function frame(now) {
+  raf = requestAnimationFrame(frame);
+  if (!orig) return;
+  const t = (now - t0) / 1000, H = orig.height;
+  const dt = Math.min(0.05, (now - (frame.prev || now)) / 1000); frame.prev = now;
+  ctx.drawImage(base, 0, 0);
+  let alive = 0;
+  for (const l of letters) {
+    if (l.state === 0 && t >= l.tStart) { bctx.drawImage(l.patch, l.x, l.y); l.state = 1; }
+    if (l.state === 1) {
+      const k = Math.min(1, (t - l.tStart) / 0.35);
+      l.dx = (Math.random() - 0.5) * 1.6 * k; l.dy = Math.sin(t * 40 + l.x) * 0.6 * k;
+      if (t >= l.tFall) { l.state = 2; l.dx = 0; }
+    }
+    if (l.state === 2) {
+      l.vy += H * 1.1 * dt; l.dy += l.vy * dt; l.dx += l.vx * dt; l.r += l.vr * dt * Math.min(1, l.vy / (H * 0.5));
+      if (l.y + l.dy > H + l.h) { l.state = 3; }
+    }
+    if (l.state === 1 || l.state === 2) {
+      alive++;
+      ctx.save();
+      ctx.translate(l.x + l.w / 2 + l.dx, l.y + l.h / 2 + l.dy); ctx.rotate(l.r);
+      ctx.drawImage(l.glyph, -l.w / 2, -l.h / 2);
+      ctx.restore();
+    } else if (l.state === 0) alive++;
+  }
+  if (playing && alive === 0) { playing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
+  if (recStopAt && now >= recStopAt) { recStopAt = 0; rec.stop(); }
+}
+
+/* ---------- flow ---------- */
+async function process(canvas) {
+  orig = canvas;
+  $('busy').style.display = 'grid'; $('busyP').style.width = '0%';
+  try {
+    const w = await getWorker();
+    const { data } = await w.recognize(canvas, {}, { blocks: true });
+    const boxes = collectBoxes(data, canvas.width, canvas.height);
+    // light text on dark/colour grounds reads better inverted
+    $('busyT').textContent = 'Looking for light letters…';
+    const inv = document.createElement('canvas'); inv.width = canvas.width; inv.height = canvas.height;
+    const ic = inv.getContext('2d'); ic.filter = 'invert(1) grayscale(1) contrast(1.4)'; ic.drawImage(canvas, 0, 0);
+    const r2 = await w.recognize(inv, {}, { blocks: true });
+    for (const b of collectBoxes(r2.data, canvas.width, canvas.height)) {
+      b.line += 1000;
+      if (!boxes.some(a => overlap(a, b) > 0.3)) boxes.push(b);
+    }
+    letters = cutLetters(boxes);
+  } catch (e) {
+    letters = []; console.error(e);
+  }
+  $('busy').style.display = 'none';
+  cv.width = orig.width; cv.height = orig.height;
+  cv.style.display = 'block'; video.style.display = 'none';
+  $('live').style.display = 'none'; $('play').style.display = 'flex';
+  if (!letters.length) { say('No letters found', 'try closer, straight on, in good light'); ctx.drawImage(orig, 0, 0); playing = false; return; }
+  $('msg').style.display = 'none';
+  reset();
+  if (!raf) raf = requestAnimationFrame(frame);
+}
+
+function backToLive() {
+  if (rec && rec.state === 'recording') rec.stop();
+  playing = false; orig = null; letters = [];
+  cv.style.display = 'none'; video.style.display = 'block';
+  $('play').style.display = 'none'; $('live').style.display = 'flex';
+  say('Crying Walls', 'point at a poster with words, then tap');
+  if (!stream) startCam();
+}
+
+function toggleRec() {
+  const btn = $('rec');
+  if (rec && rec.state === 'recording') { rec.stop(); return; }
+  if (!orig || !letters.length) return;
+  if (!cv.captureStream || !window.MediaRecorder) { btn.textContent = 'Not supported'; return; }
+  const types = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
+  const type = types.find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
+  rec = new MediaRecorder(cv.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: 10e6 } : {});
+  chunks = [];
+  rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const mt = rec.mimeType || type || 'video/webm';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(chunks, { type: mt }));
+    a.download = 'crying-wall-' + Date.now() + (mt.includes('mp4') ? '.mp4' : '.webm');
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    btn.classList.remove('on'); btn.textContent = '● Record';
+  };
+  reset();
+  rec.start(250);
+  btn.classList.add('on'); btn.textContent = '■ Stop';
+}
+
+$('shoot').addEventListener('click', () => { const c = grabVisible(); if (c) process(c); });
+$('file').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (f) process(await fromFile(f)); });
+$('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); });
+$('again').addEventListener('click', () => { if (letters.length) reset(); });
+$('new').addEventListener('click', backToLive);
+$('rec').addEventListener('click', toggleRec);
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('sel', x === b));
+  speed = parseFloat(b.dataset.s); if (letters.length) reset();
+}));
+
+startCam();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Crying Walls</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;min-height:100%;background:#0b0a0c;color:#f4efe9;font-family:'Courier Prime',ui-monospace,monospace}
+  *{box-sizing:border-box}
+  .wrap{max-width:760px;margin:0 auto;padding:28px max(5vw,16px) 120px}
+  h1{font-weight:400;font-size:32px;margin:0 0 8px}
+  p{opacity:.72;line-height:1.55;margin:0 0 16px;font-size:15px}
+  button,label.btn{font:inherit;font-size:15px;background:#f4efe9;color:#0b0a0c;border:0;border-radius:999px;padding:11px 20px;min-height:44px;cursor:pointer;display:inline-flex;align-items:center}
+  button.ghost,label.ghost{background:transparent;color:#f4efe9;border:1px solid rgba(255,255,255,.3)}
+  button:disabled{opacity:.45;cursor:default}
+  button:focus-visible,label.btn:focus-within{outline:2px solid #f4efe9;outline-offset:3px}
+  input[type=file]{position:absolute;opacity:0;width:1px;height:1px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:14px 0}
+  .poster{border:1px solid #2c2930;border-radius:16px;padding:14px;margin:18px 0;background:#121015}
+  .poster h2{font-weight:400;font-size:17px;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+  @media(max-width:600px){.grid{grid-template-columns:minmax(0,1fr)}}
+  .pv{width:100%;border-radius:10px;cursor:crosshair;touch-action:manipulation;background:#000;display:block}
+  textarea{width:100%;min-height:150px;height:100%;background:#1a171e;color:#f4efe9;border:1px solid #34303a;border-radius:12px;padding:12px;font:16px/1.5 'Courier Prime',monospace;resize:vertical}
+  .note{font-size:13px;opacity:.55;margin-top:8px}
+  #status{font-size:14px;min-height:1.4em;margin-top:10px}
+  #ar{position:fixed;inset:0;display:none;background:#000;overflow:hidden;z-index:10}
+  #arUI{position:fixed;inset:0;z-index:20;pointer-events:none;display:none}
+  #back{position:absolute;top:calc(14px + env(safe-area-inset-top));left:14px;pointer-events:auto;background:rgba(18,16,20,.55);color:#f4efe9;border:1px solid rgba(255,255,255,.3)}
+  #cap{position:absolute;left:50%;bottom:calc(36px + env(safe-area-inset-bottom));transform:translateX(-50%);max-width:min(88vw,460px);padding:9px 16px;border-radius:18px;background:rgba(30,28,34,.55);border:1px solid rgba(255,255,255,.7);font-size:13px;text-align:center;opacity:0;transition:opacity .6s;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+  #visitor{display:none;min-height:100vh;place-items:center;text-align:center;padding:24px}
+  #visitor h1{font-size:28px}
+</style>
+</head>
+<body>
+
+<section id="visitor">
+  <div>
+    <h1>This wall is crying</h1>
+    <p>Point your camera at the poster.</p>
+    <button id="vstart">Open camera</button>
+    <div id="vstatus" class="note"></div>
+  </div>
+</section>
+
+<main class="wrap" id="maker">
+  <h1>Crying Walls</h1>
+  <p>Add a photo of each poster or sticker. Tap the photo where the tears should start (eyes, a crack, the top edge), then write what it cries. If you don't tap anywhere, it cries from the top edge.</p>
+  <div class="row">
+    <label class="btn">+ Add poster photos<input id="file" type="file" accept="image/*" multiple></label>
+  </div>
+  <div id="list"></div>
+  <div class="row">
+    <button id="make" disabled>Make it cry</button>
+    <button class="ghost" id="dlMind" hidden>Download targets.mind</button>
+    <button class="ghost" id="dlJson" hidden>Download wall.json</button>
+  </div>
+  <div id="status" role="status"></div>
+  <p class="note">Photograph posters straight on, in even light. Busy, detailed images track best. Building the targets takes a little while; doing it on a laptop is faster.</p>
+</main>
+
+<div id="ar"></div>
+<div id="arUI"><button id="back">← Back</button><div id="cap"></div></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.150.1/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { MindARThree } from 'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js';
+import { Compiler } from 'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js';
+{
+const $ = id => document.getElementById(id);
+const posters = [];          // {img, aspect, points:[[u,v]], text}
+let mindBuffer = null, mindar = null, cfgPosters = null;
+
+/* ---------- maker ---------- */
+function loadImage(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => {
+      // downscale big phone photos so compiling stays fast
+      const max = 1000, s = Math.min(1, max / Math.max(im.width, im.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      const out = new Image();
+      out.onload = () => res(out);
+      out.onerror = rej;
+      out.src = c.toDataURL('image/jpeg', 0.92);
+    };
+    im.onerror = rej;
+    im.src = url;
+  });
+}
+
+function drawPreview(p) {
+  const c = p.canvas, ctx = c.getContext('2d');
+  c.width = p.img.width; c.height = p.img.height;
+  ctx.drawImage(p.img, 0, 0);
+  const pts = p.points.length ? p.points : defaultPoints();
+  const r = Math.max(6, c.width * 0.012);
+  pts.forEach(([u, v]) => {
+    const x = u * c.width, y = v * c.height;
+    ctx.beginPath();
+    ctx.moveTo(x, y - r * 1.8);
+    ctx.quadraticCurveTo(x + r, y - r * 0.2, x, y + r);
+    ctx.quadraticCurveTo(x - r, y - r * 0.2, x, y - r * 1.8);
+    ctx.fillStyle = p.points.length ? 'rgba(255,255,255,.95)' : 'rgba(255,255,255,.45)';
+    ctx.strokeStyle = '#000'; ctx.lineWidth = Math.max(1.5, r * 0.25);
+    ctx.fill(); ctx.stroke();
+  });
+}
+const defaultPoints = () => [0.15, 0.35, 0.55, 0.75, 0.9].map(u => [u, 0.02]);
+
+function renderList() {
+  const list = $('list'); list.innerHTML = '';
+  posters.forEach((p, i) => {
+    const el = document.createElement('div'); el.className = 'poster';
+    el.innerHTML = `<h2><span>Poster ${i + 1}</span><span class="row" style="margin:0"><button class="ghost" data-a="clear">Clear tears</button><button class="ghost" data-a="del">Remove</button></span></h2>
+      <div class="grid"><div><canvas class="pv" aria-label="Tap to place tear starting points"></canvas><div class="note">Tap to add a tear, tap one again to remove it.</div></div>
+      <textarea placeholder="what does this wall cry?\none line per thought" aria-label="Text for poster ${i + 1}"></textarea></div>`;
+    p.canvas = el.querySelector('canvas');
+    const ta = el.querySelector('textarea'); ta.value = p.text;
+    ta.addEventListener('input', () => { p.text = ta.value; invalidate(); });
+    p.canvas.addEventListener('pointerdown', e => {
+      const b = p.canvas.getBoundingClientRect();
+      const u = (e.clientX - b.left) / b.width, v = (e.clientY - b.top) / b.height;
+      const hit = p.points.findIndex(([a, c]) => Math.hypot(a - u, (c - v) * p.aspect) < 0.04);
+      if (hit >= 0) p.points.splice(hit, 1); else p.points.push([u, v]);
+      drawPreview(p); invalidate();
+    });
+    el.querySelector('[data-a=clear]').onclick = () => { p.points = []; drawPreview(p); invalidate(); };
+    el.querySelector('[data-a=del]').onclick = () => { posters.splice(i, 1); mindBuffer = null; $("dlMind").hidden = $("dlJson").hidden = true; renderList(); };
+    list.appendChild(el);
+    drawPreview(p);
+  });
+  $('make').disabled = !posters.length;
+}
+
+function invalidate() { $('dlJson').hidden = !mindBuffer; }
+
+$('file').addEventListener('change', async e => {
+  const files = [...e.target.files]; e.target.value = '';
+  $('status').textContent = 'Loading photos…';
+  for (const f of files) {
+    try { const img = await loadImage(f); posters.push({ img, aspect: img.height / img.width, points: [], text: '' }); }
+    catch (err) { $('status').textContent = 'Could not read ' + f.name; }
+  }
+  mindBuffer = null; $('dlMind').hidden = $('dlJson').hidden = true;
+  $('status').textContent = '';
+  renderList();
+});
+
+function configFromMaker() {
+  return posters.map(p => ({ aspect: p.aspect, points: p.points.length ? p.points : defaultPoints(), text: p.text.trim() || 'I am still here.' }));
+}
+
+$('make').addEventListener('click', async () => {
+  const btn = $('make'); btn.disabled = true;
+  try {
+    if (!mindBuffer) {
+      $('status').textContent = 'Learning the posters… 0%';
+      const compiler = new Compiler();
+      await compiler.compileImageTargets(posters.map(p => p.img), pr => { $('status').textContent = `Learning the posters… ${Math.round(pr)}%`; });
+      mindBuffer = await compiler.exportData();
+      $('dlMind').hidden = $('dlJson').hidden = false;
+    }
+    $('status').textContent = '';
+    await startAR(URL.createObjectURL(new Blob([mindBuffer])), configFromMaker());
+  } catch (err) {
+    $('status').textContent = 'Something went wrong: ' + (err && err.message || err);
+  } finally { btn.disabled = false; }
+});
+
+function download(blob, name) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+$('dlMind').onclick = () => mindBuffer && download(new Blob([mindBuffer]), 'targets.mind');
+$('dlJson').onclick = () => download(new Blob([JSON.stringify({ mind: 'targets.mind', posters: configFromMaker() }, null, 2)], { type: 'application/json' }), 'wall.json');
+
+/* ---------- tears ---------- */
+const texCache = new Map();
+function charTex(ch) {
+  if (texCache.has(ch)) return texCache.get(ch);
+  const c = document.createElement('canvas'); c.width = c.height = 96;
+  const x = c.getContext('2d');
+  x.font = "64px 'Courier Prime', monospace"; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.shadowColor = 'rgba(0,0,0,.85)'; x.shadowBlur = 10; x.fillStyle = '#fff';
+  x.fillText(ch, 48, 52);
+  x.shadowColor = 'rgba(255,255,255,.7)'; x.shadowBlur = 8; x.fillText(ch, 48, 52);
+  const t = new THREE.CanvasTexture(c); texCache.set(ch, t); return t;
+}
+const plane = new THREE.PlaneGeometry(1, 1);
+
+class Tears {
+  constructor(cfg, group) {
+    this.group = group; this.active = false; this.cfg = cfg;
+    this.lines = cfg.text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+    if (!this.lines.length) this.lines = ['...'];
+    this.sources = cfg.points.map(([u, v], k) => ({
+      x: u - 0.5, y: (0.5 - v) * cfg.aspect,
+      line: k % this.lines.length, i: 0, t: Math.random() * 0.6
+    }));
+    this.drops = []; this.bottom = -0.5 * cfg.aspect - 0.45;
+  }
+  currentLine() { return this.lines[this.sources[0].line]; }
+  emit(s) {
+    const line = this.lines[s.line];
+    let ch = line[s.i++];
+    if (s.i >= line.length) { s.i = 0; s.line = (s.line + this.sources.length) % this.lines.length; s.t = -0.9; }
+    if (!ch || ch === ' ') { s.t -= 0.15; return; }
+    const m = new THREE.Mesh(plane, new THREE.MeshBasicMaterial({ map: charTex(ch), transparent: true, depthWrite: false, opacity: 0 }));
+    const size = 0.045 + Math.random() * 0.02;
+    m.position.set(s.x + (Math.random() - 0.5) * 0.01, s.y, 0.002);
+    m.rotation.z = (Math.random() - 0.5) * 0.3;
+    this.group.add(m);
+    this.drops.push({ m, size, age: 0, vy: 0, wob: Math.random() * 6.28, x0: m.position.x });
+  }
+  update(dt) {
+    if (this.active) for (const s of this.sources) {
+      s.t += dt;
+      while (s.t > 0.16) { s.t -= 0.16; this.emit(s); }
+    }
+    const keep = [];
+    for (const d of this.drops) {
+      d.age += dt;
+      const bead = Math.min(1, d.age / 0.35);           // swell at the source, then run
+      d.m.scale.setScalar(d.size * (0.4 + 0.6 * bead));
+      if (d.age > 0.35) { d.vy += 0.22 * dt; d.m.position.y -= d.vy * dt + 0.03 * dt; }
+      d.m.position.x = d.x0 + Math.sin(d.age * 2 + d.wob) * 0.004;
+      const y = d.m.position.y;
+      const fade = y < this.bottom + 0.25 ? Math.max(0, (y - this.bottom) / 0.25) : 1;
+      d.m.material.opacity = Math.min(1, d.age * 4) * fade;
+      if (y < this.bottom) { this.group.remove(d.m); d.m.material.dispose(); }
+      else keep.push(d);
+    }
+    this.drops = keep;
+  }
+}
+
+/* ---------- AR ---------- */
+async function startAR(mindUrl, cfg) {
+  $('maker').style.display = 'none'; $('visitor').style.display = 'none';
+  $('ar').style.display = 'block'; $('arUI').style.display = 'block';
+  mindar = new MindARThree({ container: $('ar'), imageTargetSrc: mindUrl, maxTrack: 1, filterMinCF: 0.0001, filterBeta: 0.001 });
+  const { renderer, scene, camera } = mindar;
+  const cap = $('cap');
+  const systems = cfg.map((c, i) => {
+    const a = mindar.addAnchor(i);
+    const t = new Tears(c, a.group);
+    a.onTargetFound = () => { t.active = true; cap.textContent = t.currentLine(); cap.style.opacity = 1; };
+    a.onTargetLost = () => { t.active = false; cap.style.opacity = 0; };
+    return t;
+  });
+  await mindar.start();
+  const clock = new THREE.Clock();
+  let capT = 0;
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    systems.forEach(s => s.update(dt));
+    if ((capT += dt) > 0.5) { capT = 0; const s = systems.find(s => s.active); if (s) cap.textContent = s.currentLine(); }
+    renderer.render(scene, camera);
+  });
+}
+
+function stopAR() {
+  if (mindar) { try { mindar.renderer.setAnimationLoop(null); mindar.stop(); } catch (e) {} mindar = null; }
+  $('ar').innerHTML = ''; $('ar').style.display = 'none'; $('arUI').style.display = 'none'; $('cap').style.opacity = 0;
+  document.querySelectorAll('body > .mindar-ui-overlay').forEach(n => n.remove());
+  if (cfgPosters) $('visitor').style.display = 'grid'; else $('maker').style.display = 'block';
+}
+$('back').addEventListener('click', stopAR);
+
+/* ---------- visitor mode: wall.json next to this page ---------- */
+(async () => {
+  if (new URLSearchParams(location.search).has('make')) return;
+  try {
+    const r = await fetch('wall.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const cfg = await r.json();
+    if (!cfg || !Array.isArray(cfg.posters) || !cfg.posters.length) return;
+    cfgPosters = cfg.posters;
+    $('maker').style.display = 'none'; $('visitor').style.display = 'grid';
+    $('vstart').onclick = async () => {
+      $('vstatus').textContent = 'Opening camera…';
+      try { await startAR(cfg.mind || 'targets.mind', cfgPosters); $('vstatus').textContent = ''; }
+      catch (e) { stopAR(); $('vstatus').textContent = 'Camera could not start. Allow camera access and try again.'; }
+    };
+  } catch (e) { /* no wall.json: stay in maker mode */ }
+})();
+}
+</script>
+</body>
+</html>
