@@ -25,13 +25,6 @@
   #rec.on{background:#e5484d;border-color:#e5484d;color:#fff}
   .seg button.sel{background:#f4efe9;color:#0b0a0c}
   #play{display:none}
-  #msgBox{position:fixed;inset:0;display:none;place-items:center;z-index:7;background:rgba(11,10,12,.7);padding:20px}
-  .mcard{width:min(460px,100%);background:#16141a;border:1px solid #34303a;border-radius:16px;padding:18px}
-  .mcard b{font-weight:400;font-size:18px;display:block;margin-bottom:6px}
-  .mcard p{opacity:.65;font-size:14px;margin:0 0 12px;line-height:1.45}
-  .mcard textarea{width:100%;background:#0f0e12;color:#f4efe9;border:1px solid #34303a;border-radius:10px;padding:12px;font:16px/1.5 'Courier Prime',monospace;resize:vertical}
-  .mrow{display:flex;justify-content:flex-end;margin-top:12px}
-  .mcard button{background:#f4efe9;color:#0b0a0c}
   #busy{position:fixed;inset:0;display:none;place-items:center;z-index:6;background:rgba(11,10,12,.55);text-align:center;padding:24px}
   #busy .t{font-size:16px}
   #busy .p{height:2px;width:200px;background:rgba(255,255,255,.2);margin:14px auto 0;overflow:hidden;border-radius:2px}
@@ -54,16 +47,9 @@
   <button id="again">↺ Again</button>
   <span class="seg" role="group" aria-label="Speed"><button data-s="1.8">Slow</button> <button data-s="1" class="sel">Normal</button> <button data-s="0.5">Fast</button></span>
   <button id="rec">● Record</button>
-  <button id="words">✎ Words</button>
-  <button id="new">New</button>
+    <button id="new">New</button>
 </div>
 
-<div id="msgBox" role="dialog" aria-label="Your words"><div class="mcard">
-  <b>What should the wall say after it cries?</b>
-  <p>It spells this with its own fallen letters. Leave empty to just let it cry.</p>
-  <textarea id="msgIn" rows="3" placeholder="non ti aspetto più"></textarea>
-  <div class="mrow"><button id="msgOk">Done</button></div>
-</div></div>
 <div id="busy"><div><div class="t" id="busyT">Reading the letters…</div><div class="p"><i id="busyP"></i></div></div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js"></script>
@@ -212,7 +198,10 @@ function cutLetters(boxes) {
     }
     glyph.getContext('2d').putImageData(gd, 0, 0);
     patch.getContext('2d').putImageData(pd, 0, 0);
-    res.push({ x: x0, y: y0, w, h, line: b.line, ch: b.ch || '', glyph, patch });
+    let ir = 0, ig = 0, ib = 0, iw = 0; // average ink colour
+    for (let i = 0; i < w * h; i++) { const a2 = alpha[i]; if (a2 > 0.5) { ir += gd.data[i * 4] * a2; ig += gd.data[i * 4 + 1] * a2; ib += gd.data[i * 4 + 2] * a2; iw += a2; } }
+    const inkCol = iw ? `rgb(${Math.round(ir / iw)},${Math.round(ig / iw)},${Math.round(ib / iw)})` : `rgb(${bg.join(',')})`;
+    res.push({ x: x0, y: y0, w, h, line: b.line, ch: b.ch || '', glyph, patch, ink: inkCol });
   }
   return res;
 }
@@ -306,87 +295,7 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 50);
 let baseTex = null, baseMesh = null, IW = 1, A = 1, camD = 2, viewH = 1, baseDirty = false;
 let tilt = { x: 0, y: 0 }, tilt0 = null, tiltRaw = null;
-let comp = [], composing = false, compT0 = 0, compEnd = 0;
-let message = '';
-try { message = localStorage.getItem('walls-message') || ''; } catch (e) {}
 
-/* ---------- after the fall: the wall's own letters spell your words ---------- */
-function fallbackGlyph(ch, hPx, dark) {
-  const c = document.createElement('canvas'), fs = 96;
-  const x = c.getContext('2d'); x.font = `700 ${fs}px 'Courier Prime', monospace`;
-  const w = Math.ceil(x.measureText(ch).width) + 8; c.width = w; c.height = Math.round(fs * 1.15);
-  const y = c.getContext('2d'); y.font = `700 ${fs}px 'Courier Prime', monospace`; y.textBaseline = 'middle';
-  y.fillStyle = dark ? '#f1ece4' : '#1c1a20'; y.fillText(ch, 4, c.height / 2);
-  return { glyph: c, w: c.width * hPx / c.height, h: hPx };
-}
-
-function startCompose(now) {
-  const words = message.trim(); if (!words) return false;
-  const pool = {};
-  for (const l of letters) if (l.ch && l.ch.length === 1) (pool[l.ch] = pool[l.ch] || []).push(l);
-  const hs = letters.filter(l => l.ch).map(l => l.h).sort((a, b) => a - b);
-  const med = hs.length ? hs[hs.length >> 1] : IW * 0.05;
-  const targetH = Math.max(IW * 0.045, Math.min(IW * 0.1, med * 1.3));
-  const dark = (() => { const d = orig.getContext('2d').getImageData(0, 0, orig.width, orig.height).data; let s = 0, n = 0; for (let i = 0; i < d.length; i += 400) { s += d[i] + d[i + 1] + d[i + 2]; n += 3; } return s / n < 100; })();
-  // pick a glyph for every character: same letter from the wall, other case, or typed
-  const items = [...words].map(ch => {
-    if (/\s/.test(ch)) return { space: true };
-    const src = pool[ch] || pool[ch.toLowerCase()] || pool[ch.toUpperCase()];
-    if (src && src.length) {
-      const l = src[Math.floor(Math.random() * src.length)];
-      const k = targetH / Math.max(1, l.h) * (0.85 + Math.random() * 0.3);
-      return { glyph: l.glyph, w: l.w * k, h: l.h * k };
-    }
-    return fallbackGlyph(ch, targetH, dark);
-  });
-  // wrap into lines that fit the page
-  const maxW = IW * 0.86, space = targetH * 0.45, gapX = targetH * 0.06, lines = [[]];
-  let lineW = 0, word = [], wordW = 0;
-  const flush = () => { if (!word.length) return; if (lineW && lineW + wordW > maxW) { lines.push([]); lineW = 0; } if (lineW) { lines[lines.length - 1].push({ space: true }); lineW += space; } lines[lines.length - 1].push(...word); lineW += wordW; word = []; wordW = 0; };
-  for (const it of items) { if (it.space) flush(); else { word.push(it); wordW += it.w + gapX; } }
-  flush();
-  const lh = targetH * 1.4, total = lines.length * lh;
-  let y = orig.height / 2 - total / 2 + lh / 2, idx = 0;
-  for (const line of lines) {
-    const lw = line.reduce((s, it) => s + (it.space ? space : it.w + gapX), 0);
-    let x = IW / 2 - lw / 2;
-    for (const it of line) {
-      if (it.space) { x += space; continue; }
-      const c = glyphMeshes(it.glyph, it.w / IW, it.h / IW);
-      c.dest = new THREE.Vector3((x + it.w / 2) / IW - 0.5, A / 2 - (y + (Math.random() - 0.5) * targetH * 0.12) / IW, 0.01 + Math.random() * 0.008);
-      c.from = new THREE.Vector3((Math.random() - 0.5) * 0.9, -viewH / 2 - 0.15, 0.12 + Math.random() * 0.1);
-      c.rot0 = new THREE.Euler((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 3);
-      c.rot1 = (Math.random() - 0.5) * 0.16;
-      c.t0 = idx * 0.09 + Math.random() * 0.15; c.dur = 1.1 + Math.random() * 0.4;
-      c.grp.position.copy(c.from); c.grp.visible = false;
-      comp.push(c); idx++;
-      x += it.w + gapX;
-    }
-    y += lh;
-  }
-  composing = true; compT0 = now;
-  compEnd = Math.max(...comp.map(c => c.t0 + c.dur)) + 2.5;
-  return true;
-}
-
-function updateCompose(now) {
-  const t = (now - compT0) / 1000;
-  for (const c of comp) {
-    const k = Math.min(1, Math.max(0, (t - c.t0) / c.dur));
-    c.grp.visible = t >= c.t0;
-    if (!c.grp.visible) continue;
-    const e = 1 - Math.pow(1 - k, 3);
-    c.grp.position.lerpVectors(c.from, c.dest, e);
-    c.grp.position.z = c.from.z + (c.dest.z - c.from.z) * e + Math.sin(k * Math.PI) * 0.06;
-    c.grp.rotation.set(c.rot0.x * (1 - e), c.rot0.y * (1 - e), c.rot0.z * (1 - e) + c.rot1 * e);
-    const z = c.grp.position.z;
-    c.shadow.material.opacity = 0.38 * e;
-    c.shadow.position.set(c.grp.position.x + z * 0.45, c.grp.position.y - z * 0.6, 0.0002);
-    c.shadow.rotation.z = c.grp.rotation.z;
-    c.shadow.scale.setScalar(1.05 + z * 6);
-  }
-  return t >= compEnd;
-}
 
 function sizeView() {
   const w = innerWidth, h = innerHeight;
@@ -410,8 +319,6 @@ function askMotion() {
 
 function clearScene() {
   for (const l of letters) dropMeshes(l);
-  for (const c of comp) dropMeshes(c);
-  comp = []; composing = false;
   if (baseMesh) { scene.remove(baseMesh); baseMesh.geometry.dispose(); baseMesh.material.dispose(); baseMesh = null; }
   if (baseTex) { baseTex.dispose(); baseTex = null; }
 }
@@ -457,16 +364,17 @@ function dropMeshes(l) {
 function schedule() {
   const n = letters.length;
   const order = letters.map((l, i) => i).sort((a, b) => (Math.round(letters[a].y / 40) - Math.round(letters[b].y / 40)) || (letters[a].x - letters[b].x));
-  const gap = Math.max(0.03, Math.min(0.22, 7 / Math.max(1, n))) * speed;
+  const gap = Math.max(0.05, Math.min(0.3, 10 / Math.max(1, n))) * speed;
+  let wave = 0;
   order.forEach((li, rank) => {
     const l = letters[li];
-    l.tStart = 1.0 * speed + rank * gap + Math.random() * 1.4 * speed; // starts trembling
-    l.tLift = l.tStart + 0.3 + Math.random() * 0.3;                    // peels up
-    l.tFall = l.tLift + 0.45 + Math.random() * 0.35;                    // lets go
-    l.lift = 0.025 + Math.random() * 0.035;
-    l.peel = (Math.random() - 0.5) * 0.9;
-    l.state = 0; l.vy = 0; l.vz = 0;
-    l.rv = new THREE.Vector3((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 2.5);
+    if (Math.random() < 0.08) wave += (0.8 + Math.random() * 1.2) * speed;         // a pause, like catching breath
+    l.tStart = 1.2 * speed + wave + rank * gap + Math.random() * 1.6 * speed;      // wells up
+    l.tSlide = l.tStart + (0.5 + Math.random() * 0.6) * speed;                      // starts running down
+    l.slideDist = (0.04 + Math.random() * 0.18) * A;                                 // how far it runs before it drips
+    l.slideSpeed = 0.025 + Math.random() * 0.05;
+    l.state = 0; l.vy = 0; l.run = 0; l.lastStreak = 0;
+    l.sway = (Math.random() - 0.5) * 0.012;
   });
 }
 
@@ -480,7 +388,6 @@ function reset() {
   t0 = performance.now(); playing = true;
 }
 
-const ease = k => 1 - Math.pow(1 - k, 3);
 function frame(now) {
   raf = requestAnimationFrame(frame);
   if (!orig || !baseMesh) return;
@@ -492,31 +399,49 @@ function frame(now) {
     if (l.state === 3) continue;
     alive++;
     const g = l.grp, sh = l.shadow;
-    if (l.state === 1) {
-      const k = Math.min(1, (t - l.tStart) / 0.3);
-      g.rotation.z = Math.sin(t * 45 + l.x) * 0.05 * k;
-      g.position.x = l.home.x + (Math.random() - 0.5) * 0.0015 * k;
-      if (t >= l.tLift) l.state = 2;
+    if (l.state === 1) {                       // welling up: swells, trembles, lifts a hair off the wall
+      const k = Math.min(1, (t - l.tStart) / (l.tSlide - l.tStart));
+      g.scale.set(1 + 0.06 * k, 1 + 0.1 * k, 1);
+      g.position.z = 0.0004 + 0.004 * k;
+      g.rotation.z = Math.sin(t * 30 + l.x) * 0.025 * k;
+      sh.material.opacity = 0.25 * k;
+      if (t >= l.tSlide) l.state = 2;
     }
-    if (l.state === 2) {
-      const k = ease(Math.min(1, (t - l.tLift) / (l.tFall - l.tLift)));
-      g.position.x = l.home.x; g.position.z = 0.0004 + l.lift * k;
-      g.rotation.x = l.peel * k; g.rotation.y = l.peel * 0.4 * k; g.rotation.z *= 0.9;
-      sh.material.opacity = 0.42 * k;
-      if (t >= l.tFall) l.state = 2.5;
+    if (l.state === 2) {                       // running down the wall, stretching, leaving a wet streak
+      l.vy = Math.min(l.vy + 0.05 * dt, l.slideSpeed * 2.5);
+      const v = l.slideSpeed * 0.4 + l.vy;
+      g.position.y -= v * dt; l.run += v * dt;
+      g.position.x = l.home.x + Math.sin(l.run * 40) * l.sway * 0.3 + l.sway * l.run * 4;
+      const k = Math.min(1, l.run / Math.max(0.01, l.slideDist));
+      g.scale.set(1 - 0.18 * k, 1 + 0.55 * k, 1);
+      g.rotation.z *= 0.95;
+      // the streak: the letter's own ink, painted where it passes
+      if (t - l.lastStreak > 0.03) {
+        l.lastStreak = t;
+        const pxX = (g.position.x + 0.5) * IW, pxY = (A / 2 - g.position.y) * IW - l.h * 0.35;
+        bctx.save();
+        bctx.globalAlpha = 0.07 + 0.05 * (1 - k);
+        bctx.fillStyle = l.ink;
+        bctx.beginPath();
+        bctx.ellipse(pxX, pxY, Math.max(1.2, l.w * (0.22 - 0.1 * k)), Math.max(2, l.h * 0.22), 0, 0, Math.PI * 2);
+        bctx.fill();
+        bctx.restore();
+        baseDirty = true;
+      }
+      if (l.run >= l.slideDist || g.position.y < -A / 2 + l.h / IW * 0.5) { l.state = 2.5; l.vy = 0.05; }
     }
-    if (l.state === 2.5) {
-      l.vy += 1.5 * dt; l.vz += 0.12 * dt;
-      g.position.y -= l.vy * dt; g.position.z += l.vz * dt;
-      g.rotation.x += l.rv.x * dt * Math.min(1, l.vy * 2); g.rotation.y += l.rv.y * dt * Math.min(1, l.vy * 2); g.rotation.z += l.rv.z * dt;
-      sh.material.opacity = Math.max(0, sh.material.opacity - dt * 1.2);
+    if (l.state === 2.5) {                     // the drip lets go
+      l.vy += 1.3 * dt;
+      g.position.y -= l.vy * dt; g.position.z += 0.05 * dt;
+      g.scale.set(0.8, Math.min(2.2, g.scale.y + dt * 0.8), 1);
+      g.rotation.z += (Math.random() - 0.5) * 0.02;
+      sh.material.opacity = Math.max(0, sh.material.opacity - dt * 1.5);
       if (g.position.y < -viewH / 2 - 0.15) { dropMeshes(l); l.state = 3; continue; }
     }
-    // shadow sits on the page, offset by height (light from top left)
     const z = g.position.z;
-    sh.position.set(g.position.x + z * 0.45, Math.max(g.position.y, -A / 2) - z * 0.6, 0.0002);
+    sh.position.set(g.position.x + z * 0.45 + 0.002, Math.max(g.position.y, -A / 2) - z * 0.6 - 0.002, 0.0002);
     sh.rotation.z = g.rotation.z;
-    sh.scale.setScalar(1.05 + z * 6);
+    sh.scale.set(g.scale.x * 1.05, g.scale.y * 1.05, 1);
   }
   if (baseDirty) { baseTex.needsUpdate = true; baseDirty = false; }
   // camera: phone tilt (or mouse) gives parallax, plus a slow drift
@@ -530,10 +455,7 @@ function frame(now) {
   camera.position.z = camD;
   camera.lookAt(0, 0, 0);
   renderer.render(scene, camera);
-  if (playing && alive === 0) {
-    if (!composing && !comp.length && startCompose(now)) { /* words are coming */ }
-    else if (!composing || updateCompose(now)) { playing = false; composing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
-  } else if (composing) updateCompose(now);
+  if (playing && alive === 0) { playing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
   if (recStopAt && now >= recStopAt) { recStopAt = 0; rec.stop(); }
 }
 
@@ -609,11 +531,6 @@ $('file').addEventListener('change', async e => { const f = e.target.files[0]; e
 $('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); });
 $('again').addEventListener('click', () => { if (letters.length) reset(); });
 $('new').addEventListener('click', backToLive);
-$('words').addEventListener('click', () => { $('msgIn').value = message; $('msgBox').style.display = 'grid'; $('msgIn').focus(); });
-$('msgOk').addEventListener('click', () => {
-  message = $('msgIn').value; try { localStorage.setItem('walls-message', message); } catch (e) {}
-  $('msgBox').style.display = 'none'; if (letters.length) reset();
-});
 $('rec').addEventListener('click', toggleRec);
 document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('sel', x === b));
