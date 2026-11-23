@@ -25,6 +25,13 @@
   #rec.on{background:#e5484d;border-color:#e5484d;color:#fff}
   .seg button.sel{background:#f4efe9;color:#0b0a0c}
   #play{display:none}
+  #msgBox{position:fixed;inset:0;display:none;place-items:center;z-index:7;background:rgba(11,10,12,.7);padding:20px}
+  .mcard{width:min(460px,100%);background:#16141a;border:1px solid #34303a;border-radius:16px;padding:18px}
+  .mcard b{font-weight:400;font-size:18px;display:block;margin-bottom:6px}
+  .mcard p{opacity:.65;font-size:14px;margin:0 0 12px;line-height:1.45}
+  .mcard textarea{width:100%;background:#0f0e12;color:#f4efe9;border:1px solid #34303a;border-radius:10px;padding:12px;font:16px/1.5 'Courier Prime',monospace;resize:vertical}
+  .mrow{display:flex;justify-content:flex-end;margin-top:12px}
+  .mcard button{background:#f4efe9;color:#0b0a0c}
   #busy{position:fixed;inset:0;display:none;place-items:center;z-index:6;background:rgba(11,10,12,.55);text-align:center;padding:24px}
   #busy .t{font-size:16px}
   #busy .p{height:2px;width:200px;background:rgba(255,255,255,.2);margin:14px auto 0;overflow:hidden;border-radius:2px}
@@ -47,9 +54,16 @@
   <button id="again">↺ Again</button>
   <span class="seg" role="group" aria-label="Speed"><button data-s="1.8">Slow</button> <button data-s="1" class="sel">Normal</button> <button data-s="0.5">Fast</button></span>
   <button id="rec">● Record</button>
+  <button id="words">✎ Words</button>
   <button id="new">New</button>
 </div>
 
+<div id="msgBox" role="dialog" aria-label="Your words"><div class="mcard">
+  <b>What should the wall say after it cries?</b>
+  <p>It spells this with its own fallen letters. Leave empty to just let it cry.</p>
+  <textarea id="msgIn" rows="3" placeholder="non ti aspetto più"></textarea>
+  <div class="mrow"><button id="msgOk">Done</button></div>
+</div></div>
 <div id="busy"><div><div class="t" id="busyT">Reading the letters…</div><div class="p"><i id="busyP"></i></div></div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js"></script>
@@ -125,11 +139,11 @@ function collectBoxes(data, W, H) {
     for (const w of l.words || []) {
       if (w.confidence < 25 || !/[\p{L}\p{N}]/u.test(w.text)) continue;
       const syms = (w.symbols || []).filter(s => /[\p{L}\p{N}!?&.,'’-]/u.test(s.text));
-      const boxes = syms.length ? syms.map(s => s.bbox) : splitWord(w);
+      const boxes = syms.length ? syms.map(s => ({ ...s.bbox, ch: s.text })) : splitWord(w);
       for (const bb of boxes) {
         const bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0;
         if (bw < 2 || bh < 5 || bw > W * 0.5 || bh > H * 0.6) continue;
-        out.push({ x0: bb.x0, y0: bb.y0, x1: bb.x1, y1: bb.y1, line: lineNo });
+        out.push({ x0: bb.x0, y0: bb.y0, x1: bb.x1, y1: bb.y1, line: lineNo, ch: bb.ch || '' });
       }
     }
   }
@@ -142,7 +156,8 @@ function overlap(a, b) {
 }
 function splitWord(w) {
   const n = Math.max(1, [...w.text].length), { x0, y0, x1, y1 } = w.bbox, step = (x1 - x0) / n;
-  return Array.from({ length: n }, (_, i) => ({ x0: Math.round(x0 + i * step), y0, x1: Math.round(x0 + (i + 1) * step), y1 }));
+  const chars = [...w.text];
+  return Array.from({ length: n }, (_, i) => ({ x0: Math.round(x0 + i * step), y0, x1: Math.round(x0 + (i + 1) * step), y1, ch: chars[i] }));
 }
 
 /* ---------- cutting letters out of the photo ---------- */
@@ -197,12 +212,22 @@ function cutLetters(boxes) {
     }
     glyph.getContext('2d').putImageData(gd, 0, 0);
     patch.getContext('2d').putImageData(pd, 0, 0);
-    res.push({ x: x0, y: y0, w, h, line: b.line, glyph, patch });
+    res.push({ x: x0, y: y0, w, h, line: b.line, ch: b.ch || '', glyph, patch });
   }
   return res;
 }
 
 /* ---------- finding ink shapes (handwriting, missed letters) ---------- */
+function ringNoise(g, W, H, x0, y0, x1, y1) {
+  const vals = [], pad = 3;
+  const at = (x, y) => g[Math.max(0, Math.min(H - 1, y)) * W + Math.max(0, Math.min(W - 1, x))];
+  for (let x = x0 - pad; x <= x1 + pad; x += 2) { vals.push(at(x, y0 - pad), at(x, y1 + pad)); }
+  for (let y = y0 - pad; y <= y1 + pad; y += 2) { vals.push(at(x0 - pad, y), at(x1 + pad, y)); }
+  vals.sort((p, q) => p - q);
+  // spread of the middle 80%: ignores a stray neighbouring letter
+  const lo = vals[Math.floor(vals.length * 0.1)], hi = vals[Math.floor(vals.length * 0.9)];
+  return (hi - lo) / 2;
+}
 function findBlobs(canvas, avoid) {
   const W = canvas.width, H = canvas.height;
   const d = canvas.getContext('2d').getImageData(0, 0, W, H).data;
@@ -212,7 +237,7 @@ function findBlobs(canvas, avoid) {
   const darkPage = sum / N < 95;
   const W1 = W + 1, I = new Float64Array(W1 * (H + 1));
   for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += g[y * W + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + row; } }
-  const r = Math.max(8, Math.round(Math.min(W, H) / 40)), C = 16;
+  const r = Math.max(8, Math.round(Math.min(W, H) / 40)), C = 22;
   const m = new Uint8Array(N);
   for (let y = 0; y < H; y++) {
     const ya = Math.max(0, y - r), yb = Math.min(H, y + r + 1);
@@ -231,7 +256,7 @@ function findBlobs(canvas, avoid) {
   for (let i = 0; i < N; i++) if (m[i] && ((hr[i] > longRun && vr[i] <= 3) || (vr[i] > longRun && hr[i] <= 3))) m[i] = 0;
   // connected components
   const seen = new Uint8Array(N), stack = new Int32Array(N), out = [];
-  const minH = Math.max(6, H * 0.006), maxH = H * 0.2, maxW = W * 0.3;
+  const minH = Math.max(6, H * 0.006), maxH = H * 0.09, maxW = W * 0.2;
   for (let i = 0; i < N; i++) {
     if (!m[i] || seen[i]) continue;
     let sp = 0, n = 0, x0 = W, x1 = 0, y0 = H, y1 = 0;
@@ -246,13 +271,31 @@ function findBlobs(canvas, avoid) {
       }
     }
     const w = x1 - x0 + 1, h = y1 - y0 + 1, fill = n / (w * h);
-    if (n < 14 || h < minH || h > maxH || w > maxW || w / h > 8 || h / w > 12 || fill < 0.06 || fill > 0.92) continue;
+    if (n < 14 || h < minH || h > maxH || w > maxW || w / h > 7 || h / w > 8 || fill < 0.08 || fill > 0.8) continue;
     const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     if (avoid.some(b => cx >= b.x0 - 2 && cx <= b.x1 + 2 && cy >= b.y0 - 2 && cy <= b.y1 + 2)) continue;
+    // letters sit on a calm background; bits of photos are surrounded by texture
+    if (ringNoise(g, W, H, x0, y0, x1, y1) > 14) continue;
     out.push({ x0, y0, x1, y1, line: 2000, area: w * h });
   }
-  out.sort((p, q) => q.area - p.area);
-  return out.slice(0, 600);
+  // text comes in rows: keep shapes with at least two similar neighbours on the same line
+  const cand = out.length > 4000 ? out.sort((p, q) => q.area - p.area).slice(0, 4000) : out;
+  const kept = cand.filter(a => {
+    const ah = a.y1 - a.y0, acy = (a.y0 + a.y1) / 2;
+    let k = 0;
+    for (const b of cand) {
+      if (b === a) continue;
+      const bh = b.y1 - b.y0;
+      if (bh < ah * 0.45 || bh > ah * 2.2) continue;
+      if (Math.abs((b.y0 + b.y1) / 2 - acy) > ah * 0.6) continue;
+      const gap = Math.max(b.x0 - a.x1, a.x0 - b.x1);
+      if (gap > ah * 2.5) continue;
+      if (++k >= 2) return true;
+    }
+    return false;
+  });
+  kept.sort((p, q) => q.area - p.area);
+  return kept.slice(0, 600);
 }
 
 /* ---------- 3D scene ---------- */
@@ -263,6 +306,87 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 50);
 let baseTex = null, baseMesh = null, IW = 1, A = 1, camD = 2, viewH = 1, baseDirty = false;
 let tilt = { x: 0, y: 0 }, tilt0 = null, tiltRaw = null;
+let comp = [], composing = false, compT0 = 0, compEnd = 0;
+let message = '';
+try { message = localStorage.getItem('walls-message') || ''; } catch (e) {}
+
+/* ---------- after the fall: the wall's own letters spell your words ---------- */
+function fallbackGlyph(ch, hPx, dark) {
+  const c = document.createElement('canvas'), fs = 96;
+  const x = c.getContext('2d'); x.font = `700 ${fs}px 'Courier Prime', monospace`;
+  const w = Math.ceil(x.measureText(ch).width) + 8; c.width = w; c.height = Math.round(fs * 1.15);
+  const y = c.getContext('2d'); y.font = `700 ${fs}px 'Courier Prime', monospace`; y.textBaseline = 'middle';
+  y.fillStyle = dark ? '#f1ece4' : '#1c1a20'; y.fillText(ch, 4, c.height / 2);
+  return { glyph: c, w: c.width * hPx / c.height, h: hPx };
+}
+
+function startCompose(now) {
+  const words = message.trim(); if (!words) return false;
+  const pool = {};
+  for (const l of letters) if (l.ch && l.ch.length === 1) (pool[l.ch] = pool[l.ch] || []).push(l);
+  const hs = letters.filter(l => l.ch).map(l => l.h).sort((a, b) => a - b);
+  const med = hs.length ? hs[hs.length >> 1] : IW * 0.05;
+  const targetH = Math.max(IW * 0.045, Math.min(IW * 0.1, med * 1.3));
+  const dark = (() => { const d = orig.getContext('2d').getImageData(0, 0, orig.width, orig.height).data; let s = 0, n = 0; for (let i = 0; i < d.length; i += 400) { s += d[i] + d[i + 1] + d[i + 2]; n += 3; } return s / n < 100; })();
+  // pick a glyph for every character: same letter from the wall, other case, or typed
+  const items = [...words].map(ch => {
+    if (/\s/.test(ch)) return { space: true };
+    const src = pool[ch] || pool[ch.toLowerCase()] || pool[ch.toUpperCase()];
+    if (src && src.length) {
+      const l = src[Math.floor(Math.random() * src.length)];
+      const k = targetH / Math.max(1, l.h) * (0.85 + Math.random() * 0.3);
+      return { glyph: l.glyph, w: l.w * k, h: l.h * k };
+    }
+    return fallbackGlyph(ch, targetH, dark);
+  });
+  // wrap into lines that fit the page
+  const maxW = IW * 0.86, space = targetH * 0.45, gapX = targetH * 0.06, lines = [[]];
+  let lineW = 0, word = [], wordW = 0;
+  const flush = () => { if (!word.length) return; if (lineW && lineW + wordW > maxW) { lines.push([]); lineW = 0; } if (lineW) { lines[lines.length - 1].push({ space: true }); lineW += space; } lines[lines.length - 1].push(...word); lineW += wordW; word = []; wordW = 0; };
+  for (const it of items) { if (it.space) flush(); else { word.push(it); wordW += it.w + gapX; } }
+  flush();
+  const lh = targetH * 1.4, total = lines.length * lh;
+  let y = orig.height / 2 - total / 2 + lh / 2, idx = 0;
+  for (const line of lines) {
+    const lw = line.reduce((s, it) => s + (it.space ? space : it.w + gapX), 0);
+    let x = IW / 2 - lw / 2;
+    for (const it of line) {
+      if (it.space) { x += space; continue; }
+      const c = glyphMeshes(it.glyph, it.w / IW, it.h / IW);
+      c.dest = new THREE.Vector3((x + it.w / 2) / IW - 0.5, A / 2 - (y + (Math.random() - 0.5) * targetH * 0.12) / IW, 0.01 + Math.random() * 0.008);
+      c.from = new THREE.Vector3((Math.random() - 0.5) * 0.9, -viewH / 2 - 0.15, 0.12 + Math.random() * 0.1);
+      c.rot0 = new THREE.Euler((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 3);
+      c.rot1 = (Math.random() - 0.5) * 0.16;
+      c.t0 = idx * 0.09 + Math.random() * 0.15; c.dur = 1.1 + Math.random() * 0.4;
+      c.grp.position.copy(c.from); c.grp.visible = false;
+      comp.push(c); idx++;
+      x += it.w + gapX;
+    }
+    y += lh;
+  }
+  composing = true; compT0 = now;
+  compEnd = Math.max(...comp.map(c => c.t0 + c.dur)) + 2.5;
+  return true;
+}
+
+function updateCompose(now) {
+  const t = (now - compT0) / 1000;
+  for (const c of comp) {
+    const k = Math.min(1, Math.max(0, (t - c.t0) / c.dur));
+    c.grp.visible = t >= c.t0;
+    if (!c.grp.visible) continue;
+    const e = 1 - Math.pow(1 - k, 3);
+    c.grp.position.lerpVectors(c.from, c.dest, e);
+    c.grp.position.z = c.from.z + (c.dest.z - c.from.z) * e + Math.sin(k * Math.PI) * 0.06;
+    c.grp.rotation.set(c.rot0.x * (1 - e), c.rot0.y * (1 - e), c.rot0.z * (1 - e) + c.rot1 * e);
+    const z = c.grp.position.z;
+    c.shadow.material.opacity = 0.38 * e;
+    c.shadow.position.set(c.grp.position.x + z * 0.45, c.grp.position.y - z * 0.6, 0.0002);
+    c.shadow.rotation.z = c.grp.rotation.z;
+    c.shadow.scale.setScalar(1.05 + z * 6);
+  }
+  return t >= compEnd;
+}
 
 function sizeView() {
   const w = innerWidth, h = innerHeight;
@@ -286,6 +410,8 @@ function askMotion() {
 
 function clearScene() {
   for (const l of letters) dropMeshes(l);
+  for (const c of comp) dropMeshes(c);
+  comp = []; composing = false;
   if (baseMesh) { scene.remove(baseMesh); baseMesh.geometry.dispose(); baseMesh.material.dispose(); baseMesh = null; }
   if (baseTex) { baseTex.dispose(); baseTex = null; }
 }
@@ -299,8 +425,14 @@ function buildBase() {
 }
 
 function makeMeshes(l) {
-  const tex = new THREE.CanvasTexture(l.glyph); tex.colorSpace = THREE.SRGBColorSpace;
-  const w = l.w / IW, h = l.h / IW, geo = new THREE.PlaneGeometry(w, h);
+  Object.assign(l, glyphMeshes(l.glyph, l.w / IW, l.h / IW));
+  l.grp.position.set((l.x + l.w / 2) / IW - 0.5, A / 2 - (l.y + l.h / 2) / IW, 0.0004);
+  l.shadow.position.set(l.grp.position.x, l.grp.position.y, 0.0002);
+  l.home = l.grp.position.clone();
+}
+function glyphMeshes(canvas, w, h) {
+  const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
+  const geo = new THREE.PlaneGeometry(w, h);
   const grp = new THREE.Group(), layers = 6, thick = Math.min(w, h) * 0.22 + 0.0015;
   for (let i = layers; i >= 0; i--) {
     const shade = i === 0 ? 1 : 0.32 + 0.3 * (1 - i / layers);
@@ -310,10 +442,8 @@ function makeMeshes(l) {
   }
   const shadow = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, color: 0x000000, transparent: true, opacity: 0, depthWrite: false }));
   shadow.scale.setScalar(1.08);
-  grp.position.set((l.x + l.w / 2) / IW - 0.5, A / 2 - (l.y + l.h / 2) / IW, 0.0004);
-  shadow.position.set(grp.position.x, grp.position.y, 0.0002);
   scene.add(shadow); scene.add(grp);
-  l.grp = grp; l.shadow = shadow; l.tex = tex; l.geo = geo; l.home = grp.position.clone();
+  return { grp, shadow, tex, geo };
 }
 function dropMeshes(l) {
   if (!l.grp) return;
@@ -400,7 +530,10 @@ function frame(now) {
   camera.position.z = camD;
   camera.lookAt(0, 0, 0);
   renderer.render(scene, camera);
-  if (playing && alive === 0) { playing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
+  if (playing && alive === 0) {
+    if (!composing && !comp.length && startCompose(now)) { /* words are coming */ }
+    else if (!composing || updateCompose(now)) { playing = false; composing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
+  } else if (composing) updateCompose(now);
   if (recStopAt && now >= recStopAt) { recStopAt = 0; rec.stop(); }
 }
 
@@ -476,6 +609,11 @@ $('file').addEventListener('change', async e => { const f = e.target.files[0]; e
 $('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); });
 $('again').addEventListener('click', () => { if (letters.length) reset(); });
 $('new').addEventListener('click', backToLive);
+$('words').addEventListener('click', () => { $('msgIn').value = message; $('msgBox').style.display = 'grid'; $('msgIn').focus(); });
+$('msgOk').addEventListener('click', () => {
+  message = $('msgIn').value; try { localStorage.setItem('walls-message', message); } catch (e) {}
+  $('msgBox').style.display = 'none'; if (letters.length) reset();
+});
 $('rec').addEventListener('click', toggleRec);
 document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('sel', x === b));
