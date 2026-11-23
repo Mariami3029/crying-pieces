@@ -12,7 +12,7 @@
   *{box-sizing:border-box}
   #v,#c{position:fixed;inset:0;width:100%;height:100%;display:block}
   #v{object-fit:cover}
-  #c{object-fit:contain;display:none;background:#0b0a0c}
+  #c{display:none;background:#0b0a0c;touch-action:none}
   .top{position:fixed;top:calc(16px + env(safe-area-inset-top));left:0;right:0;text-align:center;font-size:14px;z-index:5;text-shadow:0 1px 8px #000;padding:0 16px;pointer-events:none}
   .top b{display:block;font-weight:400;font-size:22px;margin-bottom:4px}
   .bar{position:fixed;left:0;right:0;bottom:calc(18px + env(safe-area-inset-bottom));display:flex;justify-content:center;align-items:center;gap:10px;z-index:5;flex-wrap:wrap;padding:0 12px}
@@ -53,10 +53,11 @@
 <div id="busy"><div><div class="t" id="busyT">Reading the letters…</div><div class="p"><i id="busyP"></i></div></div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js"></script>
-<script>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 {
 const $ = id => document.getElementById(id);
-const video = $('v'), cv = $('c'), ctx = cv.getContext('2d');
+const video = $('v'), cv = $('c');
 const MAXSIDE = 1440;
 const TESS_OPTS = window.TESS_OPTS || {};
 
@@ -201,6 +202,127 @@ function cutLetters(boxes) {
   return res;
 }
 
+/* ---------- finding ink shapes (handwriting, missed letters) ---------- */
+function findBlobs(canvas, avoid) {
+  const W = canvas.width, H = canvas.height;
+  const d = canvas.getContext('2d').getImageData(0, 0, W, H).data;
+  const N = W * H, g = new Float32Array(N);
+  let sum = 0;
+  for (let i = 0; i < N; i++) { const v = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]; g[i] = v; sum += v; }
+  const darkPage = sum / N < 95;
+  const W1 = W + 1, I = new Float64Array(W1 * (H + 1));
+  for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += g[y * W + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + row; } }
+  const r = Math.max(8, Math.round(Math.min(W, H) / 40)), C = 16;
+  const m = new Uint8Array(N);
+  for (let y = 0; y < H; y++) {
+    const ya = Math.max(0, y - r), yb = Math.min(H, y + r + 1);
+    for (let x = 0; x < W; x++) {
+      const xa = Math.max(0, x - r), xb = Math.min(W, x + r + 1);
+      const mean = (I[yb * W1 + xb] - I[ya * W1 + xb] - I[yb * W1 + xa] + I[ya * W1 + xa]) / ((yb - ya) * (xb - xa));
+      const v = g[y * W + x];
+      m[y * W + x] = darkPage ? (v > mean + C ? 1 : 0) : (v < mean - C ? 1 : 0);
+    }
+  }
+  // remove ruled / grid lines: long thin runs
+  const longRun = Math.max(40, W * 0.04);
+  const hr = new Uint16Array(N), vr = new Uint16Array(N);
+  for (let y = 0; y < H; y++) { let x = 0; while (x < W) { if (!m[y * W + x]) { x++; continue; } let e = x; while (e < W && m[y * W + e]) e++; for (let k = x; k < e; k++) hr[y * W + k] = Math.min(65535, e - x); x = e; } }
+  for (let x = 0; x < W; x++) { let y = 0; while (y < H) { if (!m[y * W + x]) { y++; continue; } let e = y; while (e < H && m[e * W + x]) e++; for (let k = y; k < e; k++) vr[k * W + x] = Math.min(65535, e - y); y = e; } }
+  for (let i = 0; i < N; i++) if (m[i] && ((hr[i] > longRun && vr[i] <= 3) || (vr[i] > longRun && hr[i] <= 3))) m[i] = 0;
+  // connected components
+  const seen = new Uint8Array(N), stack = new Int32Array(N), out = [];
+  const minH = Math.max(6, H * 0.006), maxH = H * 0.2, maxW = W * 0.3;
+  for (let i = 0; i < N; i++) {
+    if (!m[i] || seen[i]) continue;
+    let sp = 0, n = 0, x0 = W, x1 = 0, y0 = H, y1 = 0;
+    stack[sp++] = i; seen[i] = 1;
+    while (sp) {
+      const j = stack[--sp], x = j % W, y = (j / W) | 0; n++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx, yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const k = yy * W + xx; if (m[k] && !seen[k]) { seen[k] = 1; stack[sp++] = k; }
+      }
+    }
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, fill = n / (w * h);
+    if (n < 14 || h < minH || h > maxH || w > maxW || w / h > 8 || h / w > 12 || fill < 0.06 || fill > 0.92) continue;
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    if (avoid.some(b => cx >= b.x0 - 2 && cx <= b.x1 + 2 && cy >= b.y0 - 2 && cy <= b.y1 + 2)) continue;
+    out.push({ x0, y0, x1, y1, line: 2000, area: w * h });
+  }
+  out.sort((p, q) => q.area - p.area);
+  return out.slice(0, 600);
+}
+
+/* ---------- 3D scene ---------- */
+const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setClearColor(0x0b0a0c, 1);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 50);
+let baseTex = null, baseMesh = null, IW = 1, A = 1, camD = 2, viewH = 1, baseDirty = false;
+let tilt = { x: 0, y: 0 }, tilt0 = null, tiltRaw = null;
+
+function sizeView() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  const t = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  camD = Math.max(A, 1 / camera.aspect) * 1.04 / (2 * t);
+  viewH = 2 * camD * t;
+}
+addEventListener('resize', () => { if (orig) sizeView(); });
+
+addEventListener('deviceorientation', e => {
+  if (e.gamma == null) return;
+  tiltRaw = { x: e.gamma, y: e.beta };
+  if (!tilt0) tilt0 = { ...tiltRaw };
+});
+addEventListener('pointermove', e => { if (!tiltRaw) { tilt.x = (e.clientX / innerWidth - 0.5) * 2; tilt.y = (e.clientY / innerHeight - 0.5) * 2; } });
+function askMotion() {
+  try { if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') DeviceOrientationEvent.requestPermission().catch(() => {}); } catch (e) {}
+}
+
+function clearScene() {
+  for (const l of letters) dropMeshes(l);
+  if (baseMesh) { scene.remove(baseMesh); baseMesh.geometry.dispose(); baseMesh.material.dispose(); baseMesh = null; }
+  if (baseTex) { baseTex.dispose(); baseTex = null; }
+}
+
+function buildBase() {
+  IW = orig.width; A = orig.height / orig.width;
+  baseTex = new THREE.CanvasTexture(base); baseTex.colorSpace = THREE.SRGBColorSpace;
+  baseMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, A), new THREE.MeshBasicMaterial({ map: baseTex }));
+  scene.add(baseMesh);
+  sizeView();
+}
+
+function makeMeshes(l) {
+  const tex = new THREE.CanvasTexture(l.glyph); tex.colorSpace = THREE.SRGBColorSpace;
+  const w = l.w / IW, h = l.h / IW, geo = new THREE.PlaneGeometry(w, h);
+  const grp = new THREE.Group(), layers = 6, thick = Math.min(w, h) * 0.22 + 0.0015;
+  for (let i = layers; i >= 0; i--) {
+    const shade = i === 0 ? 1 : 0.32 + 0.3 * (1 - i / layers);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.3, side: THREE.DoubleSide, color: new THREE.Color(shade, shade, shade) }));
+    mesh.position.z = -thick * i / layers;
+    grp.add(mesh);
+  }
+  const shadow = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, color: 0x000000, transparent: true, opacity: 0, depthWrite: false }));
+  shadow.scale.setScalar(1.08);
+  grp.position.set((l.x + l.w / 2) / IW - 0.5, A / 2 - (l.y + l.h / 2) / IW, 0.0004);
+  shadow.position.set(grp.position.x, grp.position.y, 0.0002);
+  scene.add(shadow); scene.add(grp);
+  l.grp = grp; l.shadow = shadow; l.tex = tex; l.geo = geo; l.home = grp.position.clone();
+}
+function dropMeshes(l) {
+  if (!l.grp) return;
+  scene.remove(l.grp); scene.remove(l.shadow);
+  l.grp.children.forEach(c => c.material.dispose()); l.shadow.material.dispose();
+  l.geo.dispose(); l.tex.dispose();
+  l.grp = l.shadow = null;
+}
+
 /* ---------- animation ---------- */
 function schedule() {
   const n = letters.length;
@@ -208,45 +330,76 @@ function schedule() {
   const gap = Math.max(0.03, Math.min(0.22, 7 / Math.max(1, n))) * speed;
   order.forEach((li, rank) => {
     const l = letters[li];
-    l.tStart = 1.0 * speed + rank * gap + Math.random() * 1.4 * speed;  // starts trembling
-    l.tFall = l.tStart + 0.35 + Math.random() * 0.5;                 // lets go
-    l.state = 0; l.vx = (Math.random() - 0.5) * 30; l.vy = 0; l.r = 0; l.vr = (Math.random() - 0.5) * 2.4; l.dx = 0; l.dy = 0;
+    l.tStart = 1.0 * speed + rank * gap + Math.random() * 1.4 * speed; // starts trembling
+    l.tLift = l.tStart + 0.3 + Math.random() * 0.3;                    // peels up
+    l.tFall = l.tLift + 0.45 + Math.random() * 0.35;                    // lets go
+    l.lift = 0.025 + Math.random() * 0.035;
+    l.peel = (Math.random() - 0.5) * 0.9;
+    l.state = 0; l.vy = 0; l.vz = 0;
+    l.rv = new THREE.Vector3((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 2.5);
   });
 }
 
 function reset() {
+  clearScene();
   base = document.createElement('canvas'); base.width = orig.width; base.height = orig.height;
   bctx = base.getContext('2d'); bctx.drawImage(orig, 0, 0);
+  buildBase();
+  tilt0 = tiltRaw ? { ...tiltRaw } : null;
   schedule();
   t0 = performance.now(); playing = true;
 }
 
+const ease = k => 1 - Math.pow(1 - k, 3);
 function frame(now) {
   raf = requestAnimationFrame(frame);
-  if (!orig) return;
-  const t = (now - t0) / 1000, H = orig.height;
+  if (!orig || !baseMesh) return;
+  const t = (now - t0) / 1000;
   const dt = Math.min(0.05, (now - (frame.prev || now)) / 1000); frame.prev = now;
-  ctx.drawImage(base, 0, 0);
   let alive = 0;
   for (const l of letters) {
-    if (l.state === 0 && t >= l.tStart) { bctx.drawImage(l.patch, l.x, l.y); l.state = 1; }
+    if (l.state === 0) { alive++; if (t < l.tStart) continue; bctx.drawImage(l.patch, l.x, l.y); baseDirty = true; makeMeshes(l); l.state = 1; }
+    if (l.state === 3) continue;
+    alive++;
+    const g = l.grp, sh = l.shadow;
     if (l.state === 1) {
-      const k = Math.min(1, (t - l.tStart) / 0.35);
-      l.dx = (Math.random() - 0.5) * 1.6 * k; l.dy = Math.sin(t * 40 + l.x) * 0.6 * k;
-      if (t >= l.tFall) { l.state = 2; l.dx = 0; }
+      const k = Math.min(1, (t - l.tStart) / 0.3);
+      g.rotation.z = Math.sin(t * 45 + l.x) * 0.05 * k;
+      g.position.x = l.home.x + (Math.random() - 0.5) * 0.0015 * k;
+      if (t >= l.tLift) l.state = 2;
     }
     if (l.state === 2) {
-      l.vy += H * 1.1 * dt; l.dy += l.vy * dt; l.dx += l.vx * dt; l.r += l.vr * dt * Math.min(1, l.vy / (H * 0.5));
-      if (l.y + l.dy > H + l.h) { l.state = 3; }
+      const k = ease(Math.min(1, (t - l.tLift) / (l.tFall - l.tLift)));
+      g.position.x = l.home.x; g.position.z = 0.0004 + l.lift * k;
+      g.rotation.x = l.peel * k; g.rotation.y = l.peel * 0.4 * k; g.rotation.z *= 0.9;
+      sh.material.opacity = 0.42 * k;
+      if (t >= l.tFall) l.state = 2.5;
     }
-    if (l.state === 1 || l.state === 2) {
-      alive++;
-      ctx.save();
-      ctx.translate(l.x + l.w / 2 + l.dx, l.y + l.h / 2 + l.dy); ctx.rotate(l.r);
-      ctx.drawImage(l.glyph, -l.w / 2, -l.h / 2);
-      ctx.restore();
-    } else if (l.state === 0) alive++;
+    if (l.state === 2.5) {
+      l.vy += 1.5 * dt; l.vz += 0.12 * dt;
+      g.position.y -= l.vy * dt; g.position.z += l.vz * dt;
+      g.rotation.x += l.rv.x * dt * Math.min(1, l.vy * 2); g.rotation.y += l.rv.y * dt * Math.min(1, l.vy * 2); g.rotation.z += l.rv.z * dt;
+      sh.material.opacity = Math.max(0, sh.material.opacity - dt * 1.2);
+      if (g.position.y < -viewH / 2 - 0.15) { dropMeshes(l); l.state = 3; continue; }
+    }
+    // shadow sits on the page, offset by height (light from top left)
+    const z = g.position.z;
+    sh.position.set(g.position.x + z * 0.45, Math.max(g.position.y, -A / 2) - z * 0.6, 0.0002);
+    sh.rotation.z = g.rotation.z;
+    sh.scale.setScalar(1.05 + z * 6);
   }
+  if (baseDirty) { baseTex.needsUpdate = true; baseDirty = false; }
+  // camera: phone tilt (or mouse) gives parallax, plus a slow drift
+  if (tiltRaw && tilt0) {
+    tilt.x = Math.max(-1, Math.min(1, (tiltRaw.x - tilt0.x) / 25));
+    tilt.y = Math.max(-1, Math.min(1, (tiltRaw.y - tilt0.y) / 25));
+  }
+  const px = tilt.x * 0.09 + Math.sin(t * 0.45) * 0.012, py = -tilt.y * 0.09 + Math.cos(t * 0.37) * 0.009;
+  camera.position.x += (px - camera.position.x) * 0.08;
+  camera.position.y += (py - camera.position.y) * 0.08;
+  camera.position.z = camD;
+  camera.lookAt(0, 0, 0);
+  renderer.render(scene, camera);
   if (playing && alive === 0) { playing = false; if (rec && rec.state === 'recording') recStopAt = now + 1200; }
   if (recStopAt && now >= recStopAt) { recStopAt = 0; rec.stop(); }
 }
@@ -268,23 +421,25 @@ async function process(canvas) {
       b.line += 1000;
       if (!boxes.some(a => overlap(a, b) > 0.3)) boxes.push(b);
     }
+    $('busyT').textContent = 'Finding handwriting…';
+    await new Promise(r => setTimeout(r, 30));
+    for (const b of findBlobs(canvas, boxes)) boxes.push(b);
     letters = cutLetters(boxes);
   } catch (e) {
     letters = []; console.error(e);
   }
   $('busy').style.display = 'none';
-  cv.width = orig.width; cv.height = orig.height;
   cv.style.display = 'block'; video.style.display = 'none';
   $('live').style.display = 'none'; $('play').style.display = 'flex';
-  if (!letters.length) { say('No letters found', 'try closer, straight on, in good light'); ctx.drawImage(orig, 0, 0); playing = false; return; }
   $('msg').style.display = 'none';
   reset();
+  if (!letters.length) { say('No letters found', 'try closer, straight on, in good light'); playing = false; }
   if (!raf) raf = requestAnimationFrame(frame);
 }
 
 function backToLive() {
   if (rec && rec.state === 'recording') rec.stop();
-  playing = false; orig = null; letters = [];
+  clearScene(); playing = false; orig = null; letters = [];
   cv.style.display = 'none'; video.style.display = 'block';
   $('play').style.display = 'none'; $('live').style.display = 'flex';
   say('Crying Walls', 'point at a poster with words, then tap');
@@ -315,7 +470,8 @@ function toggleRec() {
   btn.classList.add('on'); btn.textContent = '■ Stop';
 }
 
-$('shoot').addEventListener('click', () => { const c = grabVisible(); if (c) process(c); });
+$('shoot').addEventListener('click', () => { askMotion(); const c = grabVisible(); if (c) process(c); });
+$('file').addEventListener('click', askMotion);
 $('file').addEventListener('change', async e => { const f = e.target.files[0]; e.target.value = ''; if (f) process(await fromFile(f)); });
 $('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); });
 $('again').addEventListener('click', () => { if (letters.length) reset(); });
