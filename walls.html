@@ -58,20 +58,20 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.m
 {
 const $ = id => document.getElementById(id);
 const video = $('v'), cv = $('c');
-const MAXSIDE = 1440;
+const MAXSIDE = 2048;
 const TESS_OPTS = window.TESS_OPTS || {};
 
 let facing = 'environment', stream = null, worker = null;
 let orig = null;              // canvas with the untouched photo
 let base = null, bctx = null; // canvas that gets holes as letters leave
-let letters = [], t0 = 0, playing = false, speed = 1, raf = 0;
+let letters = [], t0 = 0, playing = false, speed = 1, raf = 0, holdUntil = 0;
 let rec = null, chunks = [], recStopAt = 0;
 
 /* ---------- camera ---------- */
 async function startCam() {
   try {
     if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false });
     video.srcObject = stream; await video.play();
   } catch (e) {
     say('Camera unavailable', 'allow camera access, or use Photo to pick one');
@@ -288,7 +288,7 @@ function findBlobs(canvas, avoid) {
 }
 
 /* ---------- 3D scene ---------- */
-const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: false });
+const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: false, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setClearColor(0x0b0a0c, 1);
 const scene = new THREE.Scene();
@@ -375,6 +375,9 @@ function schedule() {
     l.slideSpeed = 0.025 + Math.random() * 0.05;
     l.state = 0; l.vy = 0; l.run = 0; l.lastStreak = 0;
     l.sway = (Math.random() - 0.5) * 0.012;
+    l.streak = Math.random() < 0.45 ? 0.5 + Math.random() * 0.8 : 0;               // only some leave a wet trail
+    if (!l.streak) l.slideDist *= 0.3;                                               // the others just slip and drop
+    l.offX = (Math.random() - 0.5) * l.w * 0.5;
   });
 }
 
@@ -385,13 +388,13 @@ function reset() {
   buildBase();
   tilt0 = tiltRaw ? { ...tiltRaw } : null;
   schedule();
-  t0 = performance.now(); playing = true;
+  t0 = performance.now(); playing = true; holdUntil = 0;
 }
 
 function frame(now) {
   raf = requestAnimationFrame(frame);
   if (!orig || !baseMesh) return;
-  const t = (now - t0) / 1000;
+  const t = playing ? (now - t0) / 1000 : (holdUntil === Infinity ? 0 : (now - t0) / 1000);
   const dt = Math.min(0.05, (now - (frame.prev || now)) / 1000); frame.prev = now;
   let alive = 0;
   for (const l of letters) {
@@ -416,14 +419,14 @@ function frame(now) {
       g.scale.set(1 - 0.18 * k, 1 + 0.55 * k, 1);
       g.rotation.z *= 0.95;
       // the streak: the letter's own ink, painted where it passes
-      if (t - l.lastStreak > 0.03) {
+      if (l.streak && t - l.lastStreak > 0.03) {
         l.lastStreak = t;
-        const pxX = (g.position.x + 0.5) * IW, pxY = (A / 2 - g.position.y) * IW - l.h * 0.35;
+        const pxX = (g.position.x + 0.5) * IW + l.offX, pxY = (A / 2 - g.position.y) * IW - l.h * 0.35;
         bctx.save();
-        bctx.globalAlpha = 0.07 + 0.05 * (1 - k);
-        bctx.fillStyle = l.ink;
+        bctx.globalAlpha = (0.035 + 0.055 * (1 - k)) * l.streak;
+        bctx.fillStyle = l.ink; bctx.shadowColor = l.ink; bctx.shadowBlur = 3;
         bctx.beginPath();
-        bctx.ellipse(pxX, pxY, Math.max(1.2, l.w * (0.22 - 0.1 * k)), Math.max(2, l.h * 0.22), 0, 0, Math.PI * 2);
+        bctx.ellipse(pxX, pxY, Math.max(0.8, l.w * (0.15 - 0.1 * k)), Math.max(2, l.h * 0.2), 0, 0, Math.PI * 2);
         bctx.fill();
         bctx.restore();
         baseDirty = true;
@@ -520,7 +523,10 @@ function toggleRec() {
     setTimeout(() => URL.revokeObjectURL(a.href), 60000);
     btn.classList.remove('on'); btn.textContent = '● Record';
   };
-  reset();
+  // show the untouched poster while the recorder warms up, then start crying
+  reset(); playing = false; holdUntil = Infinity;
+  rec.onstart = () => setTimeout(() => { reset(); }, 700);
+  setTimeout(() => { if (!playing && holdUntil === Infinity) reset(); }, 1800); // in case 'start' never fires
   rec.start(250);
   btn.classList.add('on'); btn.textContent = '■ Stop';
 }
